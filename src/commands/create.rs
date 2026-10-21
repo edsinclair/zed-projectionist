@@ -1,6 +1,5 @@
-use crate::config::load_projections_from_root;
-use crate::matcher::Matcher;
-use crate::project::find_project_root;
+use crate::config::GlobalConfig;
+use crate::project::Project;
 use crate::transform::expand_placeholders;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -8,7 +7,7 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum CreateError {
-    #[error("No project root found")]
+    #[error("No project root found (no .projections.json or matching global heuristic in parent directories)")]
     NoProjectRoot,
     #[error("Failed to load projections: {0}")]
     ConfigError(#[from] crate::config::ConfigError),
@@ -34,9 +33,13 @@ pub struct CreateResult {
 
 /// Create a new file from a template
 ///
-/// The file path is matched against projections to find a template.
-/// Parent directories are created if needed.
-pub fn create_file(file_path: &Path, force: bool) -> Result<CreateResult, CreateError> {
+/// The file path is matched against projections to find a template, using the
+/// most specific projection that has one. Parent directories are created if needed.
+pub fn create_file(
+    file_path: &Path,
+    force: bool,
+    global: &GlobalConfig,
+) -> Result<CreateResult, CreateError> {
     // Check if file already exists
     if file_path.exists() && !force {
         return Err(CreateError::FileExists(
@@ -44,19 +47,10 @@ pub fn create_file(file_path: &Path, force: bool) -> Result<CreateResult, Create
         ));
     }
 
-    // Find project root (use parent of the file path)
-    let parent = file_path.parent().unwrap_or(file_path);
-    let project_root = find_project_root(parent).ok_or(CreateError::NoProjectRoot)?;
-
-    // Load projections
-    let projections = load_projections_from_root(&project_root)?;
-
-    // Create matcher and match the (potential) file path
-    let matcher = Matcher::new(projections);
-    let matches = matcher.match_absolute_path(file_path, &project_root);
+    let project = Project::discover(file_path, global)?.ok_or(CreateError::NoProjectRoot)?;
 
     // Find first match with a template
-    for m in matches {
+    for m in project.match_file(file_path) {
         if let Some(template_lines) = &m.config.template {
             // Expand placeholders in each template line
             let expanded_lines: Vec<String> = template_lines
@@ -77,7 +71,7 @@ pub fn create_file(file_path: &Path, force: bool) -> Result<CreateResult, Create
             return Ok(CreateResult {
                 path: file_path.to_path_buf(),
                 content,
-                project_root,
+                project_root: project.root,
             });
         }
     }
@@ -129,7 +123,7 @@ mod tests {
         let temp_dir = setup_test_project();
         let new_file = temp_dir.path().join("src/utils.ts");
 
-        let result = create_file(&new_file, false).unwrap();
+        let result = create_file(&new_file, false, &GlobalConfig::default()).unwrap();
 
         assert!(new_file.exists());
         assert!(result.content.contains("export class utils"));
@@ -141,7 +135,7 @@ mod tests {
         let temp_dir = setup_test_project();
         let new_file = temp_dir.path().join("src/components/Button.tsx");
 
-        let result = create_file(&new_file, false).unwrap();
+        let result = create_file(&new_file, false, &GlobalConfig::default()).unwrap();
 
         assert!(new_file.exists());
         assert!(result.content.contains("export const Button"));
@@ -153,7 +147,7 @@ mod tests {
         let existing_file = temp_dir.path().join("src/existing.ts");
         fs::write(&existing_file, "existing content").unwrap();
 
-        let result = create_file(&existing_file, false);
+        let result = create_file(&existing_file, false, &GlobalConfig::default());
 
         assert!(matches!(result, Err(CreateError::FileExists(_))));
     }
@@ -164,8 +158,23 @@ mod tests {
         let existing_file = temp_dir.path().join("src/existing.ts");
         fs::write(&existing_file, "existing content").unwrap();
 
-        let result = create_file(&existing_file, true).unwrap();
+        let result = create_file(&existing_file, true, &GlobalConfig::default()).unwrap();
 
         assert!(result.content.contains("export class existing"));
+    }
+
+    #[test]
+    fn test_create_file_uses_most_specific_template() {
+        let temp_dir = TempDir::new().unwrap();
+        let root = temp_dir.path();
+        let config = r#"{
+            "*.go": {"template": ["package main"]},
+            "*_test.go": {"template": ["package main_test"]}
+        }"#;
+        fs::write(root.join(".projections.json"), config).unwrap();
+
+        let result =
+            create_file(&root.join("foo_test.go"), false, &GlobalConfig::default()).unwrap();
+        assert_eq!(result.content, "package main_test");
     }
 }

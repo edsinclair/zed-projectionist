@@ -28,6 +28,7 @@ fn apply_single_transformation(value: &str, transform: &str) -> String {
         "uppercase" => value.to_uppercase(),
         "lowercase" => value.to_lowercase(),
         "camelcase" => to_camel_case(value),
+        "capitalize" => capitalize(value),
         "snakecase" => to_snake_case(value),
 
         // Path component transformations
@@ -79,6 +80,10 @@ fn apply_single_transformation(value: &str, transform: &str) -> String {
         "plural" => pluralize(value),
         "singular" => singularize(value),
 
+        // Literal braces, for templates that need them
+        "open" => "{".to_string(),
+        "close" => "}".to_string(),
+
         // Unknown transformation - return unchanged
         _ => value.to_string(),
     }
@@ -92,6 +97,21 @@ fn to_camel_case(value: &str) -> String {
             .unwrap_or_default()
     })
     .to_string()
+}
+
+/// Uppercase the first letter of each `/`-separated component
+fn capitalize(value: &str) -> String {
+    value
+        .split('/')
+        .map(|component| {
+            let mut chars = component.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().chain(chars).collect(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn to_snake_case(value: &str) -> String {
@@ -145,9 +165,12 @@ fn singularize(word: &str) -> String {
 /// Placeholder syntax:
 /// - `{}` - Default placeholder (the captured stem)
 /// - `{name}` - Named placeholder
-/// - `{|transform}` - Default placeholder with transformation
-/// - `{|t1|t2}` - Chained transformations (applied left to right)
+/// - `{transform}` or `{|transform}` - Default placeholder with transformation
+/// - `{t1|t2}` - Chained transformations (applied left to right)
 /// - `{name|transform}` - Named placeholder with transformation
+///
+/// As in vim-projectionist, the first segment names a placeholder only if one
+/// with that name exists; otherwise it is the first transformation.
 pub fn expand_placeholders(template: &str, placeholders: &HashMap<String, String>) -> String {
     let re = Regex::new(r"\{([^{}]*)\}").unwrap();
 
@@ -160,27 +183,17 @@ pub fn expand_placeholders(template: &str, placeholders: &HashMap<String, String
         }
 
         let parts: Vec<&str> = content.split('|').collect();
-        let placeholder_name = parts[0];
-        let transformations: Vec<&str> = parts[1..].to_vec();
 
-        // Get the placeholder value
-        let value = if placeholder_name.is_empty() {
-            // `{|transform}` syntax - use default placeholder
-            placeholders.get("").cloned().unwrap_or_default()
-        } else {
-            // Try named placeholder, fall back to default
-            placeholders
-                .get(placeholder_name)
-                .or_else(|| placeholders.get(""))
-                .cloned()
-                .unwrap_or_default()
+        // A leading empty segment (`{|transform}`) selects the default placeholder
+        let (value, transformations) = match placeholders.get(parts[0]) {
+            Some(value) => (value.clone(), &parts[1..]),
+            None => (
+                placeholders.get("").cloned().unwrap_or_default(),
+                &parts[..],
+            ),
         };
 
-        if transformations.is_empty() {
-            value
-        } else {
-            apply_transformations(&value, &transformations)
-        }
+        apply_transformations(&value, transformations)
     })
     .to_string()
 }
@@ -280,6 +293,66 @@ mod tests {
             expand_placeholders("{|basename|uppercase}", &placeholders),
             "BAR"
         );
+    }
+
+    #[test]
+    fn test_expand_placeholders_leading_transform() {
+        let mut placeholders = HashMap::new();
+        placeholders.insert(String::new(), "user_profile/admin_role".to_string());
+
+        assert_eq!(
+            expand_placeholders("{camelcase|capitalize|dot}", &placeholders),
+            "UserProfile.AdminRole"
+        );
+        assert_eq!(
+            expand_placeholders("{underscore|camelcase}", &placeholders),
+            "userProfileAdminRole"
+        );
+        assert_eq!(
+            expand_placeholders("{uppercase}", &placeholders),
+            "USER_PROFILE/ADMIN_ROLE"
+        );
+    }
+
+    #[test]
+    fn test_expand_placeholders_named_placeholder_before_transforms() {
+        let mut placeholders = HashMap::new();
+        placeholders.insert(String::new(), "accounts/hash_password".to_string());
+        placeholders.insert("dirname".to_string(), "accounts".to_string());
+        placeholders.insert("basename".to_string(), "hash_password".to_string());
+
+        assert_eq!(
+            expand_placeholders(
+                "{dirname|capitalize}.{basename|camelcase|capitalize}",
+                &placeholders
+            ),
+            "Accounts.HashPassword"
+        );
+    }
+
+    #[test]
+    fn test_expand_placeholders_literal_braces() {
+        let mut placeholders = HashMap::new();
+        placeholders.insert(String::new(), "utils".to_string());
+
+        assert_eq!(
+            expand_placeholders(
+                "import {open} test {close} from \"@/lib/{}\";",
+                &placeholders
+            ),
+            "import { test } from \"@/lib/utils\";"
+        );
+        assert_eq!(expand_placeholders("{open}{close}", &placeholders), "{}");
+    }
+
+    #[test]
+    fn test_capitalize() {
+        assert_eq!(apply_transformations("foo", &["capitalize"]), "Foo");
+        assert_eq!(
+            apply_transformations("foo/bar_baz", &["capitalize"]),
+            "Foo/Bar_baz"
+        );
+        assert_eq!(apply_transformations("", &["capitalize"]), "");
     }
 
     #[test]

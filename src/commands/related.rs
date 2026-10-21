@@ -1,13 +1,12 @@
-use crate::config::load_projections_from_root;
-use crate::matcher::Matcher;
-use crate::project::find_project_root_with_projections;
+use crate::config::GlobalConfig;
+use crate::project::Project;
 use crate::transform::expand_placeholders;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum RelatedError {
-    #[error("No project root found (no .projections.json in parent directories)")]
+    #[error("No project root found (no .projections.json or matching global heuristic in parent directories)")]
     NoProjectRoot,
     #[error("Failed to load projections: {0}")]
     ConfigError(#[from] crate::config::ConfigError),
@@ -34,17 +33,12 @@ pub struct RelatedResult {
 }
 
 /// Find related files for a given file path
-pub fn find_related(file_path: &Path) -> Result<RelatedResult, RelatedError> {
-    // Find project root with .projections.json
-    let project_root =
-        find_project_root_with_projections(file_path).ok_or(RelatedError::NoProjectRoot)?;
-
-    // Load projections
-    let projections = load_projections_from_root(&project_root)?;
-
-    // Create matcher and match file
-    let matcher = Matcher::new(projections);
-    let matches = matcher.match_absolute_path(file_path, &project_root);
+pub fn find_related(
+    file_path: &Path,
+    global: &GlobalConfig,
+) -> Result<RelatedResult, RelatedError> {
+    let project = Project::discover(file_path, global)?.ok_or(RelatedError::NoProjectRoot)?;
+    let matches = project.match_file(file_path);
 
     let mut related_files = Vec::new();
     let mut seen_paths = std::collections::HashSet::new();
@@ -54,7 +48,7 @@ pub fn find_related(file_path: &Path) -> Result<RelatedResult, RelatedError> {
         if let Some(related_patterns) = &m.config.related {
             for pattern in related_patterns {
                 let expanded = expand_placeholders(pattern, &m.placeholders);
-                let full_path = project_root.join(&expanded);
+                let full_path = project.resolve(&expanded);
 
                 if seen_paths.insert(full_path.clone()) {
                     let search_pattern = m
@@ -72,10 +66,10 @@ pub fn find_related(file_path: &Path) -> Result<RelatedResult, RelatedError> {
             }
         }
 
-        // Also include alternate as a related file
-        if let Some(alternate_pattern) = &m.config.alternate {
+        // Also include alternates as related files
+        for alternate_pattern in m.config.alternate.iter().flatten() {
             let expanded = expand_placeholders(alternate_pattern, &m.placeholders);
-            let full_path = project_root.join(&expanded);
+            let full_path = project.resolve(&expanded);
 
             if seen_paths.insert(full_path.clone()) {
                 let search_pattern = m
@@ -95,7 +89,7 @@ pub fn find_related(file_path: &Path) -> Result<RelatedResult, RelatedError> {
 
     Ok(RelatedResult {
         files: related_files,
-        project_root,
+        project_root: project.root,
     })
 }
 
@@ -133,7 +127,7 @@ mod tests {
         let temp_dir = setup_test_project();
         let source_file = temp_dir.path().join("src/components/Button.tsx");
 
-        let result = find_related(&source_file).unwrap();
+        let result = find_related(&source_file, &GlobalConfig::default()).unwrap();
 
         // Should find: Button.module.css (exists), Button.stories.tsx (not exists), Button.test.tsx (not exists)
         assert_eq!(result.files.len(), 3);

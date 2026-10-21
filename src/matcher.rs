@@ -1,5 +1,6 @@
 use crate::config::{ProjectionConfig, Projections};
-use regex::Regex;
+use crate::transform::apply_transformations;
+use std::cmp::{Ordering, Reverse};
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -10,81 +11,174 @@ pub struct MatchResult {
     pub glob: String,
     /// The configuration for this pattern
     pub config: ProjectionConfig,
-    /// Extracted placeholders ('' key contains the stem)
+    /// Extracted placeholders ('' key contains the stem, plus 'dirname' and 'basename')
     pub placeholders: HashMap<String, String>,
+}
+
+/// A parsed projection glob
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Pattern {
+    /// No `*`: matches the path exactly, with an empty stem
+    Exact(String),
+    /// `prefix*suffix`: the stem is everything in between, slashes included
+    Star { prefix: String, suffix: String },
+    /// `prefix**infix*suffix`, e.g. `src/**/*.ts` or `tests/**/test_*.py`
+    ///
+    /// The infix is removed from the start of the last path component, so
+    /// `tests/foo/test_bar.py` matched against `tests/**/test_*.py` has the
+    /// stem `foo/bar`.
+    Recursive {
+        prefix: String,
+        infix: String,
+        suffix: String,
+    },
+}
+
+impl Pattern {
+    /// Parse a glob, returning `None` for shapes that can never match
+    fn parse(glob: &str) -> Option<Self> {
+        match glob.matches('*').count() {
+            0 => Some(Self::Exact(glob.to_string())),
+            1 => {
+                let (prefix, suffix) = glob.split_once('*')?;
+                Some(Self::Star {
+                    prefix: prefix.to_string(),
+                    suffix: suffix.to_string(),
+                })
+            }
+            3 => {
+                let (prefix, rest) = glob.split_once("**")?;
+                let (infix, suffix) = rest.split_once('*')?;
+                (!prefix.contains('*') && !infix.is_empty()).then(|| Self::Recursive {
+                    prefix: prefix.to_string(),
+                    infix: infix.to_string(),
+                    suffix: suffix.to_string(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Return the stem captured from `path`, if it matches
+    fn capture(&self, path: &str) -> Option<String> {
+        match self {
+            Self::Exact(exact) => (path == exact).then(String::new),
+            Self::Star { prefix, suffix } => path
+                .strip_prefix(prefix.as_str())?
+                .strip_suffix(suffix.as_str())
+                .map(str::to_string),
+            Self::Recursive {
+                prefix,
+                infix,
+                suffix,
+            } => {
+                let matched = path
+                    .strip_prefix(prefix.as_str())?
+                    .strip_suffix(suffix.as_str())?;
+
+                // Find the infix where no `/` follows it, i.e. at the start of
+                // the last component. The leading `/` lets `**/` match zero directories.
+                let slashed = format!("/{}", matched);
+                let start = (0..slashed.len()).find(|&i| {
+                    slashed
+                        .get(i..)
+                        .and_then(|tail| tail.strip_prefix(infix.as_str()))
+                        .is_some_and(|rest| !rest.contains('/'))
+                })?;
+
+                let stem = format!("{}/{}", &slashed[..start], &slashed[start + infix.len()..]);
+                Some(stem[1..].to_string())
+            }
+        }
+    }
+}
+
+/// Order globs from most to least specific: exact paths first, then longer
+/// globs before shorter ones, with ties broken alphabetically
+fn by_specificity(a: &str, b: &str) -> Ordering {
+    let key = |glob: &str| (glob.contains('*'), Reverse(glob.len()));
+    key(a).cmp(&key(b)).then_with(|| a.cmp(b))
+}
+
+/// Placeholders available to a match: the stem plus its dirname and basename
+fn placeholders_for(stem: String) -> HashMap<String, String> {
+    HashMap::from([
+        (
+            "dirname".to_string(),
+            apply_transformations(&stem, &["dirname"]),
+        ),
+        (
+            "basename".to_string(),
+            apply_transformations(&stem, &["basename"]),
+        ),
+        (String::new(), stem),
+    ])
+}
+
+struct Projection {
+    glob: String,
+    pattern: Pattern,
+    config: ProjectionConfig,
 }
 
 /// Handles matching files against projection patterns
 pub struct Matcher {
-    projections: Projections,
+    /// Projections in the order matches are reported
+    projections: Vec<Projection>,
 }
 
 impl Matcher {
     pub fn new(projections: Projections) -> Self {
-        Self { projections }
+        Self::layered([projections])
     }
 
-    /// Convert a projectionist glob pattern to a regex that captures the stem
+    /// Build a matcher from layers of projections
     ///
-    /// The `*` in glob patterns captures the "stem" - the variable portion
-    /// between the prefix and suffix.
-    ///
-    /// Examples:
-    /// - `src/*.ts` → `^src/(.*)\.ts$`
-    /// - `app/models/*.rb` → `^app/models/(.*)\.rb$`
-    fn glob_to_regex(glob: &str) -> Regex {
-        let star_index = glob.find('*');
+    /// Every projection in a layer is reported before those in later layers.
+    /// Within a layer, more specific patterns come first.
+    pub fn layered<L>(layers: impl IntoIterator<Item = L>) -> Self
+    where
+        L: IntoIterator<Item = (String, ProjectionConfig)>,
+    {
+        let mut projections = Vec::new();
 
-        match star_index {
-            None => {
-                // No *, escape and return exact match
-                let escaped = regex::escape(glob);
-                Regex::new(&format!("^{}$", escaped)).unwrap()
-            }
-            Some(index) => {
-                let prefix = &glob[..index];
-                let suffix = &glob[index + 1..];
-
-                let escaped_prefix = regex::escape(prefix);
-                let escaped_suffix = regex::escape(suffix);
-
-                let pattern = format!("^{}(.*){}$", escaped_prefix, escaped_suffix);
-                Regex::new(&pattern).unwrap()
-            }
+        for layer in layers {
+            let mut layer: Vec<Projection> = layer
+                .into_iter()
+                .filter_map(|(glob, config)| {
+                    Some(Projection {
+                        pattern: Pattern::parse(&glob)?,
+                        glob,
+                        config,
+                    })
+                })
+                .collect();
+            layer.sort_by(|a, b| by_specificity(&a.glob, &b.glob));
+            projections.extend(layer);
         }
+
+        Self { projections }
     }
 
     /// Match a file path against all projections and return matching results
     ///
-    /// The file path should be relative to the project root.
+    /// The file path should be relative to the project root. Results are
+    /// ordered most specific first.
     pub fn match_file(&self, relative_path: &str) -> Vec<MatchResult> {
         // Normalize path separators to forward slashes
         let normalized_path = relative_path.replace('\\', "/");
 
-        let mut matches = Vec::new();
-
-        for (glob, config) in &self.projections {
-            let regex = Self::glob_to_regex(glob);
-
-            if let Some(captures) = regex.captures(&normalized_path) {
-                let mut placeholders = HashMap::new();
-
-                // The first capture group contains the "stem"
-                if let Some(stem) = captures.get(1) {
-                    placeholders.insert(String::new(), stem.as_str().to_string());
-                } else {
-                    placeholders.insert(String::new(), String::new());
-                }
-
-                matches.push(MatchResult {
-                    glob: glob.clone(),
-                    config: config.clone(),
-                    placeholders,
-                });
-            }
-        }
-
-        matches
+        self.projections
+            .iter()
+            .filter_map(|projection| {
+                let stem = projection.pattern.capture(&normalized_path)?;
+                Some(MatchResult {
+                    glob: projection.glob.clone(),
+                    config: projection.config.clone(),
+                    placeholders: placeholders_for(stem),
+                })
+            })
+            .collect()
     }
 
     /// Match an absolute file path using the project root
@@ -109,7 +203,7 @@ mod tests {
         projections.insert(
             "src/*.ts".to_string(),
             ProjectionConfig {
-                alternate: Some("test/{}.test.ts".to_string()),
+                alternate: Some(vec!["test/{}.test.ts".to_string()]),
                 file_type: Some("source".to_string()),
                 ..Default::default()
             },
@@ -118,7 +212,7 @@ mod tests {
         projections.insert(
             "test/*.test.ts".to_string(),
             ProjectionConfig {
-                alternate: Some("src/{}.ts".to_string()),
+                alternate: Some(vec!["src/{}.ts".to_string()]),
                 file_type: Some("test".to_string()),
                 ..Default::default()
             },
@@ -127,7 +221,7 @@ mod tests {
         projections.insert(
             "app/models/*.rb".to_string(),
             ProjectionConfig {
-                alternate: Some("spec/models/{}_spec.rb".to_string()),
+                alternate: Some(vec!["spec/models/{}_spec.rb".to_string()]),
                 file_type: Some("model".to_string()),
                 ..Default::default()
             },
@@ -136,23 +230,79 @@ mod tests {
         projections
     }
 
-    #[test]
-    fn test_glob_to_regex_simple() {
-        let regex = Matcher::glob_to_regex("src/*.ts");
-        assert!(regex.is_match("src/utils.ts"));
-        assert!(regex.is_match("src/foo/bar.ts"));
-        assert!(!regex.is_match("test/utils.ts"));
-        assert!(!regex.is_match("src/utils.tsx"));
+    fn capture(glob: &str, path: &str) -> Option<String> {
+        Pattern::parse(glob).unwrap().capture(path)
+    }
+
+    fn globs(matches: &[MatchResult]) -> Vec<&str> {
+        matches.iter().map(|m| m.glob.as_str()).collect()
     }
 
     #[test]
-    fn test_glob_to_regex_captures_stem() {
-        let regex = Matcher::glob_to_regex("src/*.ts");
-        let captures = regex.captures("src/utils.ts").unwrap();
-        assert_eq!(captures.get(1).unwrap().as_str(), "utils");
+    fn test_star_pattern() {
+        assert_eq!(
+            capture("src/*.ts", "src/utils.ts").as_deref(),
+            Some("utils")
+        );
+        assert_eq!(
+            capture("src/*.ts", "src/foo/bar.ts").as_deref(),
+            Some("foo/bar")
+        );
+        assert_eq!(capture("src/*.ts", "test/utils.ts"), None);
+        assert_eq!(capture("src/*.ts", "src/utils.tsx"), None);
+    }
 
-        let captures = regex.captures("src/foo/bar.ts").unwrap();
-        assert_eq!(captures.get(1).unwrap().as_str(), "foo/bar");
+    #[test]
+    fn test_star_pattern_prefix_and_suffix_cannot_overlap() {
+        assert_eq!(capture("a*a.ts", "a.ts"), None);
+    }
+
+    #[test]
+    fn test_exact_pattern() {
+        assert_eq!(capture("README.md", "README.md").as_deref(), Some(""));
+        assert_eq!(capture("README.md", "docs/README.md"), None);
+    }
+
+    #[test]
+    fn test_recursive_pattern() {
+        assert_eq!(
+            capture("src/**/*.ts", "src/utils.ts").as_deref(),
+            Some("utils")
+        );
+        assert_eq!(
+            capture("src/**/*.ts", "src/foo/bar.ts").as_deref(),
+            Some("foo/bar")
+        );
+        assert_eq!(capture("src/**/*.ts", "lib/foo/bar.ts"), None);
+    }
+
+    #[test]
+    fn test_recursive_pattern_with_infix() {
+        let glob = "tests/**/test_*.py";
+        assert_eq!(capture(glob, "tests/test_bar.py").as_deref(), Some("bar"));
+        assert_eq!(
+            capture(glob, "tests/foo/test_bar.py").as_deref(),
+            Some("foo/bar")
+        );
+        assert_eq!(
+            capture(glob, "tests/test_foo/test_bar.py").as_deref(),
+            Some("test_foo/bar")
+        );
+        assert_eq!(capture(glob, "tests/foo/bar.py"), None);
+        assert_eq!(capture(glob, "tests/test_foo/bar.py"), None);
+    }
+
+    #[test]
+    fn test_unsupported_patterns_are_skipped() {
+        assert_eq!(Pattern::parse("src/*/*.ts"), None);
+        assert_eq!(Pattern::parse("src/***.ts"), None);
+        assert_eq!(Pattern::parse("*/**/*.ts"), None);
+
+        let mut projections = Projections::new();
+        projections.insert("src/*/*.ts".to_string(), ProjectionConfig::default());
+        assert!(Matcher::new(projections)
+            .match_file("src/a/b.ts")
+            .is_empty());
     }
 
     #[test]
@@ -208,5 +358,68 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].glob, "app/models/*.rb");
         assert_eq!(matches[0].placeholders.get("").unwrap(), "user");
+    }
+
+    #[test]
+    fn test_match_file_dirname_and_basename_placeholders() {
+        let mut projections = Projections::new();
+        projections.insert("src/**/*.rs".to_string(), ProjectionConfig::default());
+        let matcher = Matcher::new(projections);
+
+        let nested = &matcher.match_file("src/foo/bar.rs")[0].placeholders;
+        assert_eq!(nested.get("dirname").unwrap(), "foo");
+        assert_eq!(nested.get("basename").unwrap(), "bar");
+
+        let top_level = &matcher.match_file("src/bar.rs")[0].placeholders;
+        assert_eq!(top_level.get("dirname").unwrap(), "");
+        assert_eq!(top_level.get("basename").unwrap(), "bar");
+    }
+
+    #[test]
+    fn test_match_file_orders_most_specific_first() {
+        // HashMap iteration order varies between instances, so build it a few times
+        for _ in 0..20 {
+            let projections: Projections =
+                ["*.go", "*_test.go", "pkg/*_test.go", "pkg/foo_test.go"]
+                    .into_iter()
+                    .map(|glob| (glob.to_string(), ProjectionConfig::default()))
+                    .collect();
+            let matcher = Matcher::new(projections);
+
+            assert_eq!(
+                globs(&matcher.match_file("pkg/foo_test.go")),
+                ["pkg/foo_test.go", "pkg/*_test.go", "*_test.go", "*.go"]
+            );
+        }
+    }
+
+    #[test]
+    fn test_match_file_breaks_ties_alphabetically() {
+        let projections: Projections = ["a/*.ts", "*.ts", "*/b.ts"]
+            .into_iter()
+            .map(|glob| (glob.to_string(), ProjectionConfig::default()))
+            .collect();
+        let matcher = Matcher::new(projections);
+
+        assert_eq!(
+            globs(&matcher.match_file("a/b.ts")),
+            ["*/b.ts", "a/*.ts", "*.ts"]
+        );
+    }
+
+    #[test]
+    fn test_layered_matcher_reports_earlier_layers_first() {
+        let config = ProjectionConfig::default;
+        let local = vec![("*.rs".to_string(), config())];
+        let global = vec![
+            ("src/*.rs".to_string(), config()),
+            ("*.rs".to_string(), config()),
+        ];
+        let matcher = Matcher::layered([local, global]);
+
+        assert_eq!(
+            globs(&matcher.match_file("src/lib.rs")),
+            ["*.rs", "src/*.rs", "*.rs"]
+        );
     }
 }

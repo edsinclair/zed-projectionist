@@ -1,12 +1,7 @@
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use projectionist::{commands, config, GlobalConfig};
+use std::path::{Path, PathBuf};
 use std::process;
-
-mod commands;
-mod config;
-mod matcher;
-mod project;
-mod transform;
 
 #[derive(Parser)]
 #[command(
@@ -31,9 +26,13 @@ enum Commands {
         #[arg(short, long)]
         line: Option<usize>,
 
-        /// Open result in Zed editor
+        /// Open result in the editor (see --editor)
         #[arg(short, long)]
         open: bool,
+
+        /// Editor command used by --open
+        #[arg(long, env = "PROJECTIONIST_EDITOR", default_value = "zed")]
+        editor: String,
 
         /// Output as JSON
         #[arg(short, long)]
@@ -79,9 +78,13 @@ enum Commands {
         #[arg(short, long)]
         force: bool,
 
-        /// Open the created file in Zed
+        /// Open the created file in the editor (see --editor)
         #[arg(short, long)]
         open: bool,
+
+        /// Editor command used by --open
+        #[arg(long, env = "PROJECTIONIST_EDITOR", default_value = "zed")]
+        editor: String,
     },
 
     /// Show projection info for a file
@@ -125,12 +128,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             file,
             line: _line,
             open,
+            editor,
             json,
             create_if_missing,
             verbose,
         } => {
             let file = canonicalize_path(&file)?;
-            let result = commands::find_alternate(&file)?;
+            let global = GlobalConfig::load()?;
+            let result = commands::find_alternate(&file, &global)?;
 
             if verbose {
                 eprintln!("Project root: {}", result.project_root.display());
@@ -154,20 +159,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else if let Some(alternate) = result.existing.first() {
                 if open {
-                    open_in_zed(alternate)?;
+                    open_in_editor(&editor, alternate)?;
                 } else {
                     println!("{}", alternate.display());
                 }
             } else if create_if_missing {
                 if let Some(alternate) = result.paths.first() {
                     // Try to create the file
-                    match commands::create_file(alternate, false) {
+                    match commands::create_file(alternate, false, &global) {
                         Ok(created) => {
                             if verbose {
                                 eprintln!("Created: {}", created.path.display());
                             }
                             if open {
-                                open_in_zed(&created.path)?;
+                                open_in_editor(&editor, &created.path)?;
                             } else {
                                 println!("{}", created.path.display());
                             }
@@ -206,7 +211,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             verbose,
         } => {
             let file = canonicalize_path(&file)?;
-            let result = commands::find_related(&file)?;
+            let global = GlobalConfig::load()?;
+            let result = commands::find_related(&file, &global)?;
 
             if verbose {
                 eprintln!("Project root: {}", result.project_root.display());
@@ -242,19 +248,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Commands::Create { file, force, open } => {
+        Commands::Create {
+            file,
+            force,
+            open,
+            editor,
+        } => {
             let file = if file.is_absolute() {
                 file
             } else {
                 std::env::current_dir()?.join(file)
             };
 
-            let result = commands::create_file(&file, force)?;
+            let global = GlobalConfig::load()?;
+            let result = commands::create_file(&file, force, &global)?;
 
             println!("Created: {}", result.path.display());
 
             if open {
-                open_in_zed(&result.path)?;
+                open_in_editor(&editor, &result.path)?;
             }
         }
 
@@ -265,7 +277,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             verbose,
         } => {
             let file = canonicalize_path(&file)?;
-            let result = commands::get_projection_info(&file)?;
+            let global = GlobalConfig::load()?;
+            let result = commands::get_projection_info(&file, &global)?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -286,7 +299,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(ft) = &p.file_type {
                             println!("  Type: {}", ft);
                         }
-                        if let Some(alt) = &p.alternate {
+                        for alt in &p.alternate {
                             let status = if alt.exists { "✓" } else { "✗" };
                             println!("  Alternate: {} {}", status, alt.expanded);
                         }
@@ -365,11 +378,19 @@ fn canonicalize_path(path: &PathBuf) -> Result<PathBuf, Box<dyn std::error::Erro
     }
 }
 
-fn open_in_zed(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let status = process::Command::new("zed").arg(path).status()?;
+/// Open `path` with `editor`, a command that may include arguments (e.g. "code --wait")
+fn open_in_editor(editor: &str, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = editor.split_whitespace();
+    let program = args.next().ok_or("Editor command is empty")?;
+
+    let status = process::Command::new(program)
+        .args(args)
+        .arg(path)
+        .status()
+        .map_err(|e| format!("Failed to run editor `{}`: {}", program, e))?;
 
     if !status.success() {
-        return Err(format!("Failed to open {} in Zed", path.display()).into());
+        return Err(format!("Failed to open {} in {}", path.display(), program).into());
     }
 
     Ok(())
